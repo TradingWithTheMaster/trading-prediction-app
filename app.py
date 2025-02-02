@@ -8,15 +8,31 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Google Sheets Integration ---
-SCOPE = ["https://spreadsheets.google.com/feeds",
-         "https://www.googleapis.com/auth/drive"]
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 SPREADSHEET_NAME = "TradingHistory"
-CREDS_JSON = "app-for-bad-good-neutral-1a7f522537bd.json"
 
 
 def get_gsheet_client():
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_JSON, SCOPE)
+        # Load credentials from Streamlit Secrets
+        creds_dict = {
+            "type": "service_account",
+            "project_id": st.secrets["google_credentials"]["project_id"],
+            "private_key_id": st.secrets["google_credentials"]["private_key_id"],
+            "private_key": st.secrets["google_credentials"]["private_key"].replace('\\n', '\n'),
+            "client_email": st.secrets["google_credentials"]["client_email"],
+            "client_id": st.secrets["google_credentials"]["client_id"],
+            "auth_uri": st.secrets["google_credentials"]["auth_uri"],
+            "token_uri": st.secrets["google_credentials"]["token_uri"],
+            "auth_provider_x509_cert_url": st.secrets["google_credentials"]["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": st.secrets["google_credentials"]["client_x509_cert_url"],
+            "universe_domain": st.secrets["google_credentials"]["universe_domain"]
+        }
+
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
