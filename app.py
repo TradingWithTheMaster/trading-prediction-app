@@ -1,278 +1,349 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
+import calendar
 import streamlit as st
-import os
 from streamlit.components.v1 import html
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Google Sheets Integration ---
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS_JSON = "app-for-bad-good-neutral-1a7f522537bd.json"
+SCOPE = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
 SPREADSHEET_NAME = "TradingHistory"
+CREDS_JSON = "app-for-bad-good-neutral-1a7f522537bd.json"
+
 
 def get_gsheet_client():
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_JSON, SCOPE)
         client = gspread.authorize(creds)
         return client
-    except FileNotFoundError:
-        st.error("Error: Google Sheets credentials file not found!")
-        return None
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Google Sheets connection error: {str(e)}")
         return None
+
 
 def save_trade_to_sheet(trade_data):
     client = get_gsheet_client()
     if client:
-        sheet = client.open(SPREADSHEET_NAME).sheet1
-        sheet.append_row(trade_data)
+        try:
+            sheet = client.open(SPREADSHEET_NAME).sheet1
+            sheet.append_row(trade_data)
+        except Exception as e:
+            st.error(f"Failed to save trade: {str(e)}")
+
 
 def load_trade_history_from_sheet():
-    client = get_gsheet_client()
-    if client:
+    try:
+        client = get_gsheet_client()
+        if not client:
+            return pd.DataFrame()
+
         sheet = client.open(SPREADSHEET_NAME).sheet1
         data = sheet.get_all_records()
-        df = pd.DataFrame(data)
-        if not df.empty and 'Win/Lose' in df.columns:
-            df['Win/Lose'] = df['Win/Lose'].astype(int)
+
+        required_columns = {
+            'Date': pd.NaT,
+            'Win/Lose': 0,
+            'Gain': 0.0,
+            'Winning Streak': 0,
+            'Losing Streak': 0,
+            'WinRate': 0.0,
+            'Trading State': 'Neutral'
+        }
+
+        df = pd.DataFrame(data).rename(columns={
+            'Gains': 'Gain',
+            'Winning Streaks': 'Winning Streak',
+            'LoosingStreaks': 'Losing Streak',
+            'Loosing Streak': 'Losing Streak'
+        })
+
+        for col, default in required_columns.items():
+            if col not in df.columns:
+                df[col] = default
+
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['Win/Lose'] = df['Win/Lose'].astype(int)
+        df['Trading State'] = df['Trading State'].fillna('Neutral')
+
         return df
-    return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Error loading trade history: {str(e)}")
+        return pd.DataFrame()
+
 
 # --- Core Logic ---
 def calculate_streaks(df):
+    if df.empty:
+        return df
+
     df['Win/Lose'] = df['Win/Lose'].astype(int)
-    current_win_streak = 0
-    current_loss_streak = 0
-    streaks = []
+    current_win, current_loss = 0, 0
+    win_streaks, loss_streaks = [], []
+
     for outcome in df['Win/Lose']:
         if outcome == 1:
-            current_win_streak += 1
-            current_loss_streak = 0
+            current_win += 1
+            current_loss = 0
         else:
-            current_loss_streak += 1
-            current_win_streak = 0
-        streaks.append((current_win_streak, current_loss_streak))
-    df['Winning Streak'] = [s[0] for s in streaks]
-    df['Losing Streak'] = [s[1] for s in streaks]
+            current_loss += 1
+            current_win = 0
+        win_streaks.append(current_win)
+        loss_streaks.append(current_loss)
+
+    df['Winning Streak'] = win_streaks
+    df['Losing Streak'] = loss_streaks
     return df
 
+
 def calculate_win_rate(df, window=6):
-    df['Win/Lose'] = df['Win/Lose'].astype(int)
-    df['WinRate'] = df['Win/Lose'].rolling(window, min_periods=1).mean().fillna(0.5) * 100
+    if df.empty:
+        return df
+
+    df['WinRate'] = (df['Win/Lose']
+                     .rolling(window, min_periods=1)
+                     .mean()
+                     .fillna(0.5) * 100)
     return df
+
 
 def predict_state(df):
     if df.empty:
         return 'Neutral', 0.65
-    last_row = df.iloc[-1]
-    if last_row['Losing Streak'] >= 2 or last_row['WinRate'] < 45:
-        return 'Bad', 0.95
-    elif last_row['Winning Streak'] >= 2 and last_row['WinRate'] > 45:
-        return 'Good', 0.90
-    else:
-        return 'Neutral', 0.65
 
-# --- Streamlit App ---
+    last_row = df.iloc[-1]
+    losing_condition = last_row['Losing Streak'] >= 2 or last_row['WinRate'] < 45
+    winning_condition = last_row['Winning Streak'] >= 2 and last_row['WinRate'] > 55
+
+    if losing_condition:
+        return 'Bad', 0.95
+    elif winning_condition:
+        return 'Good', 0.90
+    return 'Neutral', 0.65
+
+
+# --- Calendar Visualization ---
+def create_trade_calendar(df, selected_date):
+    df['Date'] = pd.to_datetime(df['Date'])
+    daily_trades = df.groupby(df['Date'].dt.date).agg(
+        Total_Trades=('Win/Lose', 'count'),
+        Net_Wins=('Win/Lose', 'sum')
+    ).reset_index()
+
+    month = selected_date.month
+    year = selected_date.year
+
+    st.subheader(f"🗓 Trading Calendar - {selected_date.strftime('%B %Y')}")
+
+    # Month navigation
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        if st.button("← Previous Month"):
+            selected_date = selected_date - timedelta(days=selected_date.day)
+            st.session_state.calendar_date = selected_date
+    with col5:
+        if st.button("Next Month →"):
+            next_month = selected_date.replace(day=28) + timedelta(days=4)
+            selected_date = next_month - timedelta(days=next_month.day)
+            st.session_state.calendar_date = selected_date
+
+    # Calendar grid
+    cal = calendar.Calendar()
+    weeks = cal.monthdayscalendar(year, month)
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    # Header
+    cols = st.columns(7)
+    for i, day in enumerate(day_names):
+        cols[i].markdown(f"**{day}**", unsafe_allow_html=True)
+
+    # Body
+    for week in weeks:
+        cols = st.columns(7)
+        for i, day in enumerate(week):
+            if day == 0:
+                cols[i].write(" ")
+                continue
+
+            current_date = datetime(year, month, day).date()
+            daily_data = daily_trades[daily_trades['Date'] == current_date]
+
+            if not daily_data.empty:
+                total = daily_data['Total_Trades'].values[0]
+                wins = daily_data['Net_Wins'].values[0]
+                losses = total - wins
+
+                color = "#4CAF50" if wins > losses else "#FF5252" if losses > wins else "#FFA500"
+                html_content = f"""
+                <div style="border: 1px solid #e0e0e0; 
+                            border-radius: 5px; 
+                            padding: 5px; 
+                            text-align: center;
+                            background-color: {color}30;
+                            min-height: 80px;
+                            transition: all 0.2s ease;">
+                    <div style="font-weight: bold; color: {color};">{day}</div>
+                    <div style="font-size: 0.8em;">
+                        <span style="color: #4CAF50;">▲{wins}</span>
+                        <span style="color: #FF5252;">▼{losses}</span>
+                    </div>
+                </div>
+                """
+                cols[i].markdown(html_content, unsafe_allow_html=True)
+            else:
+                cols[i].markdown(f"""
+                <div style="color: #666; 
+                            text-align: center; 
+                            padding: 5px;
+                            min-height: 80px;">
+                    {day}
+                </div>
+                """, unsafe_allow_html=True)
+
+
+# --- Main App ---
 def main():
     st.set_page_config(page_title="Trading Assistant", layout="wide")
 
-    # Global CSS Animations
-    st.markdown("""
-    <style>
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .section-animation {
-            animation: fadeIn 0.8s ease-out;
-        }
-        .dataframe:hover {
-            transform: scale(1.002);
-            box-shadow: 0 4px 20px -2px rgba(0,0,0,0.1);
-            transition: all 0.3s ease;
-        }
-        @keyframes separatorAnim {
-            0% { opacity: 0.3; }
-            50% { opacity: 1; }
-            100% { opacity: 0.3; }
-        }
-        div[data-testid="stDataFrame"] {
-            background-color: ${st.get_option("theme.backgroundColor")} !important;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    # Initialize session states
+    if 'calendar_date' not in st.session_state:
+        st.session_state.calendar_date = datetime.now().date()
 
-    st.title("📈 Smart Trading Assistant")
-
-    # Initialize session state
     if 'trades' not in st.session_state:
-        cols = ['Date', 'Win/Lose', 'Gain', 'Winning Streak', 'Losing Streak', 'WinRate', 'Trading State']
-        try:
-            if os.path.exists('trade_history.csv'):
-                df = pd.read_csv('trade_history.csv')
-                if not df.empty and 'Win/Lose' in df.columns:
-                    df['Win/Lose'] = df['Win/Lose'].astype(int)
-                st.session_state.trades = calculate_streaks(df)
-                st.session_state.trades = calculate_win_rate(st.session_state.trades)
-            else:
-                st.session_state.trades = pd.DataFrame(columns=cols)
-        except Exception as e:
-            st.session_state.trades = pd.DataFrame(columns=cols)
+        df = load_trade_history_from_sheet()
+        if not df.empty:
+            df = calculate_streaks(calculate_win_rate(df))
+        else:
+            df = pd.DataFrame(columns=[
+                'Date', 'Win/Lose', 'Gain',
+                'Winning Streak', 'Losing Streak',
+                'WinRate', 'Trading State'
+            ])
+        st.session_state.trades = df
 
     # --- Trade Input Form ---
     with st.expander("➕ New Trade Entry", expanded=True):
         with st.form("trade_form"):
-            win_lose = st.radio("Trade Outcome", [1, 0], format_func=lambda x: "Win" if x else "Lose")
-            gain = st.number_input("Today's Gain (optional)", value=0.0)
-            submitted = st.form_submit_button("🚀 Save & Predict")
+            col1, col2 = st.columns(2)
+            with col1:
+                win_lose = st.radio("Outcome", [1, 0],
+                                    format_func=lambda x: "Win 🎉" if x else "Lose 💔")
+            with col2:
+                gain = st.number_input("Gain/Loss ($)", value=0.0, step=0.01)
 
-    if submitted:
-        prediction, confidence = predict_state(st.session_state.trades)
-        new_trade = {
-            'Date': datetime.now().strftime("%m/%d/%Y %H:%M"),
-            'Win/Lose': win_lose,
-            'Gain': gain,
-            'Winning Streak': 0,
-            'Losing Streak': 0,
-            'WinRate': 0.0,
-            'Trading State': prediction
-        }
-        df_new = pd.DataFrame([new_trade])
-        st.session_state.trades = pd.concat([st.session_state.trades, df_new], ignore_index=True)
-        st.session_state.trades = calculate_streaks(st.session_state.trades)
-        st.session_state.trades = calculate_win_rate(st.session_state.trades)
-        st.session_state.trades.to_csv('trade_history.csv', index=False)
+            if st.form_submit_button("💾 Save Trade"):
+                new_trade = {
+                    'Date': datetime.now(),
+                    'Win/Lose': win_lose,
+                    'Gain': gain,
+                    'Winning Streak': 0,
+                    'Losing Streak': 0,
+                    'WinRate': 0.0,
+                    'Trading State': 'Neutral'
+                }
 
-        updated_row = st.session_state.trades.iloc[-1]
-        trade_list = [
-            str(updated_row['Date']),
-            int(updated_row['Win/Lose']),
-            float(updated_row['Gain']),
-            int(updated_row['Winning Streak']),
-            int(updated_row['Losing Streak']),
-            float(updated_row['WinRate']),
-            str(updated_row['Trading State'])
-        ]
-        save_trade_to_sheet(trade_list)
+                updated_df = pd.concat([
+                    st.session_state.trades,
+                    pd.DataFrame([new_trade])
+                ], ignore_index=True)
 
-        if updated_row['Winning Streak'] >= 2:
-            html("""
-            <script>
-                setTimeout(() => {
-                    const defaults = { origin: { y: 0.7 } };
-                    function fire(ratio, opts) {
-                        confetti(Object.assign({}, defaults, opts, {
-                            particleCount: Math.floor(200 * ratio)
-                        }));
-                    }
-                    fire(0.25, { spread: 26, startVelocity: 55 });
-                    fire(0.2, { spread: 60 });
-                    fire(0.35, { spread: 100, decay: 0.91 });
-                    fire(0.1, { spread: 120, startVelocity: 25 });
-                    fire(0.1, { spread: 120, startVelocity: 45 });
-                }, 500);
-            </script>
-            """)
+                updated_df = calculate_streaks(calculate_win_rate(updated_df))
+                prediction, _ = predict_state(updated_df)
+                updated_df.at[updated_df.index[-1], 'Trading State'] = prediction
 
-    # --- Real-Time Insights ---
-    st.markdown("---")
-    st.subheader("🔍 Real-Time Trading Insights")
+                # Prepare data for Google Sheets
+                new_row = updated_df.iloc[-1]
+                trade_data = [
+                    new_row['Date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    int(new_row['Win/Lose']),
+                    float(new_row['Gain']),
+                    int(new_row['Winning Streak']),
+                    int(new_row['Losing Streak']),
+                    float(new_row['WinRate']),
+                    str(new_row['Trading State'])
+                ]
 
+                st.session_state.trades = updated_df
+                save_trade_to_sheet(trade_data)
+                st.rerun()
+
+    # --- Dashboard ---
     if not st.session_state.trades.empty:
-        updated_row = st.session_state.trades.iloc[-1]
+        latest = st.session_state.trades.iloc[-1]
         prediction, confidence = predict_state(st.session_state.trades)
-        prediction_colors = {'Good': '#4CAF50', 'Neutral': '#FFA500', 'Bad': '#FF5252'}
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"### 🔮 Predicted Next Trade Outcome")
-            st.markdown(f"""
-            <div class="section-animation" style="text-align: center; padding: 25px;
-                        background-color: {prediction_colors[prediction]}10;
-                        border: 2px solid {prediction_colors[prediction]};
-                        border-radius: 10px;">
-                <h1 style="color: {prediction_colors[prediction]}; margin: 0; transform: scale(1);">
-                    {prediction} {['🎉', '⚡', '🔥'][['Good', 'Neutral', 'Bad'].index(prediction)]}
-                </h1>
-                <p style="color: {prediction_colors[prediction]};">Confidence: {confidence * 100:.0f}%</p>
-            </div>
-            """, unsafe_allow_html=True)
+        # Prediction Display
+        prediction_color = {
+            'Good': ('#4CAF50', '🎉'),
+            'Neutral': ('#FFA500', '⚡'),
+            'Bad': ('#FF5252', '🔥')
+        }[prediction]
 
-        with col2:
-            st.markdown(f"### 📊 Performance Overview")
-            st.markdown(f"""
-            <div class="section-animation" style="padding: 20px; border-radius: 10px;
-                        background-color: {st.get_option("theme.backgroundColor")};
-                        box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px;">
-                    <div>
-                        <h3 style="color: #4CAF50;">🔥 Win Streak</h3>
-                        <h1 style="text-align: center;">{updated_row['Winning Streak']}</h1>
-                    </div>
-                    <div>
-                        <h3 style="color: #FF5252;">💔 Loss Streak</h3>
-                        <h1 style="text-align: center;">{updated_row['Losing Streak']}</h1>
-                    </div>
-                    <div>
-                        <h3 style="color: #2196F3;">🎯 Win Rate</h3>
-                        <h1 style="text-align: center;">{updated_row['WinRate']:.1f}%</h1>
-                    </div>
+        st.markdown(f"""
+        <div style="border-radius: 10px;
+                    padding: 25px;
+                    margin: 15px 0;
+                    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+                    border-left: 5px solid {prediction_color[0]};">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h2 style="color: {prediction_color[0]}; margin: 0;">
+                        {prediction} {prediction_color[1]}
+                    </h2>
+                    <p>Confidence Level: {confidence * 100:.0f}%</p>
+                </div>
+                <div style="text-align: right;">
+                    <h3>Current Streaks</h3>
+                    <p>🔥 Wins: {latest['Winning Streak']} &nbsp; 💔 Losses: {latest['Losing Streak']}</p>
                 </div>
             </div>
-            """, unsafe_allow_html=True)
-
-        caution_styles = {
-            'Good': {'bg': '#E8F5E9', 'border': '#4CAF50', 'text': '#2E7D32'},
-            'Neutral': {'bg': '#FFF3E0', 'border': '#FFA726', 'text': '#EF6C00'},
-            'Bad': {'bg': '#FFEBEE', 'border': '#EF5350', 'text': '#C62828'}
-        }
-        st.markdown(f"""
-        <div style="padding: 15px; margin-top: 20px;
-                    background-color: {caution_styles[prediction]['bg']};
-                    border-radius: 10px;
-                    border-left: 5px solid {caution_styles[prediction]['border']};">
-            <h3 style="color: {caution_styles[prediction]['text']}; margin-top: 0;">
-                {['⚠', '🔔', '⚠'][['Bad', 'Neutral', 'Good'].index(prediction)]} Trading Recommendations
-            </h3>
-            <ul style="color: {caution_styles[prediction]['text']};">
-                <li>Moderate position sizing</li>
-                <li>Confirm with technical analysis</li>
-                <li>Monitor key support/resistance</li>
-                <li>Review recent trade patterns</li>
-                <li>Consider {prediction}-specific strategies</li>
-            </ul>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("### 📈 Historical Win Rate")
-        chart_data = st.session_state.trades[['WinRate']].rename(columns={'WinRate': 'Win Rate (%)'})
-        st.line_chart(chart_data, use_container_width=True)
+        # Metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Current Win Rate", f"{latest['WinRate']:.1f}%")
+        with col2:
+            st.metric("Total Trades", len(st.session_state.trades))
+        with col3:
+            st.metric("Total Gain/Loss", f"${st.session_state.trades['Gain'].sum():.2f}")
+
+        # Historical Data
+        st.subheader("📒 Trading Journal")
+        display_df = st.session_state.trades.copy()
+        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d %H:%M')
+
+        if 'Trading State' in display_df.columns:
+            styled_df = display_df.style.applymap(
+                lambda x: 'color: #4CAF50' if x == 'Good' else
+                ('color: #FF5252' if x == 'Bad' else 'color: #FFA500'),
+                subset=['Trading State']
+            )
+        else:
+            styled_df = display_df.style
+
+        styled_df = styled_df.format({
+            'Gain': '${:.2f}',
+            'WinRate': '{:.1f}%'
+        })
+
+        st.dataframe(styled_df, use_container_width=True, height=400)
+
+        # Win Rate Chart
+        st.subheader("📈 Win Rate Trend")
+        st.line_chart(st.session_state.trades.set_index('Date')['WinRate'])
 
     else:
-        st.info("No trades recorded yet. Make your first trade above!")
+        st.info("🌟 No trades recorded yet. Make your first trade above!")
 
-    st.markdown("""
-    <div style="height: 2px;
-                background: linear-gradient(90deg, transparent 0%, #4CAF50 50%, transparent 100%);
-                margin: 2rem 0;
-                animation: separatorAnim 2s infinite;"></div>
-    """, unsafe_allow_html=True)
-
+    # --- Trading Calendar ---
     st.markdown("---")
-    st.subheader("📒 Trading Journal")
-    if not st.session_state.trades.empty:
-        styled_df = st.session_state.trades.tail(10).sort_index(ascending=False).style \
-            .applymap(
-            lambda x: 'color: #4CAF50' if x == 'Good' else ('color: #FF5252' if x == 'Bad' else 'color: #FFA726'),
-            subset=['Trading State']) \
-            .format({'WinRate': '{:.1f}%', 'Gain': '{:.2f}'})
-        st.dataframe(styled_df, use_container_width=True)
-    else:
-        st.info("No trades recorded yet. Make your first trade above!")
+    create_trade_calendar(st.session_state.trades, st.session_state.calendar_date)
+
 
 if __name__ == "__main__":
     main()
