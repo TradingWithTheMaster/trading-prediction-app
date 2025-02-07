@@ -17,7 +17,6 @@ SPREADSHEET_NAME = "TradingHistory"
 
 def get_gsheet_client():
     try:
-        # Load credentials from Streamlit Secrets
         creds_dict = {
             "type": "service_account",
             "project_id": st.secrets["google_credentials"]["project_id"],
@@ -31,7 +30,6 @@ def get_gsheet_client():
             "client_x509_cert_url": st.secrets["google_credentials"]["client_x509_cert_url"],
             "universe_domain": st.secrets["google_credentials"]["universe_domain"]
         }
-
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         client = gspread.authorize(creds)
         return client
@@ -85,7 +83,6 @@ def load_trade_history_from_sheet():
         df['Trading State'] = df['Trading State'].fillna('Neutral')
 
         return df
-
     except Exception as e:
         st.error(f"Error loading trade history: {str(e)}")
         return pd.DataFrame()
@@ -115,7 +112,7 @@ def calculate_streaks(df):
     return df
 
 
-def calculate_win_rate(df, window=6):
+def calculate_win_rate(df, window=5):  # Now using 5-trade window
     if df.empty:
         return df
 
@@ -130,14 +127,17 @@ def predict_state(df):
     if df.empty:
         return 'Neutral', 0.65
 
-    last_row = df.iloc[-1]
-    losing_condition = last_row['Losing Streak'] >= 2 or last_row['WinRate'] < 45
-    winning_condition = last_row['Winning Streak'] >= 2 and last_row['WinRate'] > 55
+    # Strictly consider last 5 trades
+    last_5 = df['Win/Lose'].tail(5)
+    if len(last_5) < 5:
+        return 'Neutral', 0.65
 
-    if losing_condition:
-        return 'Bad', 0.95
-    elif winning_condition:
+    win_rate = last_5.mean() * 100
+
+    if win_rate > 50:
         return 'Good', 0.90
+    elif win_rate < 50:
+        return 'Bad', 0.95
     return 'Neutral', 0.65
 
 
@@ -284,6 +284,7 @@ def main():
 
                 st.session_state.trades = updated_df
                 save_trade_to_sheet(trade_data)
+                st.balloons()
                 st.rerun()
 
     # --- Dashboard ---
@@ -293,56 +294,72 @@ def main():
 
         # Prediction Display
         prediction_color = {
-            'Good': ('#4CAF50', '🎉'),
-            'Neutral': ('#FFA500', '⚡'),
-            'Bad': ('#FF5252', '🔥')
+            'Good': ('#4CAF50', '🚀', 'Great Job! Keep it up!'),
+            'Neutral': ('#FFA500', '⚡', 'Stay Alert!'),
+            'Bad': ('#FF5252', '⚠️', 'Review Your Strategy!')
         }[prediction]
 
+        confidence_percent = confidence * 100
+
         st.markdown(f"""
-        <div style="border-radius: 10px;
-                    padding: 25px;
-                    margin: 15px 0;
-                    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
-                    border-left: 5px solid {prediction_color[0]};">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div style="background-color: {prediction_color[0]}20;
+                    padding: 20px;
+                    border-radius: 10px;
+                    border-left: 5px solid {prediction_color[0]};
+                    margin: 10px 0;">
+            <div style="display: flex; align-items: center;">
+                <div style="font-size: 40px; margin-right: 20px;">
+                    {prediction_color[1]}
+                </div>
                 <div>
                     <h2 style="color: {prediction_color[0]}; margin: 0;">
-                        {prediction} {prediction_color[1]}
+                        {prediction} State - {prediction_color[2]}
                     </h2>
-                    <p>Confidence Level: {confidence * 100:.0f}%</p>
-                </div>
-                <div style="text-align: right;">
-                    <h3>Current Streaks</h3>
-                    <p>🔥 Wins: {latest['Winning Streak']} &nbsp; 💔 Losses: {latest['Losing Streak']}</p>
+                    <p style="margin: 5px 0;">Confidence Level: {confidence_percent:.0f}%</p>
+                    <div style="background-color: #e0e0e0; border-radius: 5px; height: 10px;">
+                        <div style="background-color: {prediction_color[0]}; 
+                                    width: {confidence_percent}%; 
+                                    height: 10px; 
+                                    border-radius: 5px;">
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
         # Metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Current Win Rate", f"{latest['WinRate']:.1f}%")
-        with col2:
-            st.metric("Total Trades", len(st.session_state.trades))
-        with col3:
-            st.metric("Total Gain/Loss", f"${st.session_state.trades['Gain'].sum():.2f}")
+        cols = st.columns(4)
+        with cols[0]:
+            st.markdown("### 📊 Current Win Rate")
+            st.markdown(f"<h1 style='color: #4CAF50; text-align: center;'>{latest['WinRate']:.1f}%</h1>",
+                        unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown("### 🔥 Winning Streak")
+            st.markdown(f"<h1 style='color: #4CAF50; text-align: center;'>{latest['Winning Streak']}</h1>",
+                        unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown("### 💔 Losing Streak")
+            st.markdown(f"<h1 style='color: #FF5252; text-align: center;'>{latest['Losing Streak']}</h1>",
+                        unsafe_allow_html=True)
+        with cols[3]:
+            st.markdown("### 💰 Total Gain/Loss")
+            total_gain = st.session_state.trades['Gain'].sum()
+            color = "#4CAF50" if total_gain >= 0 else "#FF5252"
+            st.markdown(f"<h1 style='color: {color}; text-align: center;'>${total_gain:.2f}</h1>",
+                        unsafe_allow_html=True)
 
         # Historical Data
         st.subheader("📒 Trading Journal")
         display_df = st.session_state.trades.copy()
         display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d %H:%M')
 
-        if 'Trading State' in display_df.columns:
-            styled_df = display_df.style.applymap(
-                lambda x: 'color: #4CAF50' if x == 'Good' else
-                ('color: #FF5252' if x == 'Bad' else 'color: #FFA500'),
-                subset=['Trading State']
-            )
-        else:
-            styled_df = display_df.style
-
-        styled_df = styled_df.format({
+        styled_df = display_df.style.apply(
+            lambda x: [f'background-color: #4CAF5020' if x['Trading State'] == 'Good' else
+                       f'background-color: #FF525220' if x['Trading State'] == 'Bad' else
+                       f'background-color: #FFA50020' for _ in x],
+            axis=1
+        ).format({
             'Gain': '${:.2f}',
             'WinRate': '{:.1f}%'
         })
